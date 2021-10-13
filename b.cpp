@@ -38,9 +38,9 @@ using namespace rocksdb;
 #define WAL_OFF 0
 #define KEY_GEN_LOCAL 1
 
-#define KEY_SIZ 16
+#define KEY_SIZ 80
 //metadata size
-#define META_SIZ 128
+#define META_SIZ 48
 //chunk size
 #define CHUNK_SIZ 8
 
@@ -63,7 +63,7 @@ using namespace rocksdb;
 // #define DB_N 1
 #endif // METHOD
 
-#define PRINT_INTERVAL_N (META_N / 20)
+#define PRINT_INTERVAL_N (META_N / 50)
 #define MAX(a, b) (((a) > (b)) ? (a) : (b))
 
 struct GenerateKeyParam;
@@ -276,11 +276,11 @@ void *write_worker(void *p)
     #if KEY_GEN_LOCAL == 1
     string _h_key = ctx->LocalGenerateKey({siz, i, THREAD_N, id});
     auto it = pair<std::string, char *>(_h_key, data);
-    // int h = id % DB_N;
     #else
     auto &it = m->at(i);
     #endif
-    int h = ctx->DBDistribute(it.first);
+    int h = id % DB_N; // 线程绑定db
+    // int h = ctx->DBDistribute(it.first);
     int cf = ctx->CFDistribute(it.first);
     DB *db = dbs[h];
     do_write(db, it, id, handles[h][cf]);
@@ -298,12 +298,13 @@ void *write_worker(void *p)
 void *scan_worker(void *p)
 {
   CTX *ctx = (CTX *)p;
-
   int id = ctx->id;
+  int count = 0;
+  atomic<uint64_t> *scan_count = ctx->run_count_ptr;
+  struct timeval *start = ctx->start;
+
   int h = (id / CF_N) % DB_N;
   int cf = id % CF_N;
-  int count = 0;
-  struct timeval *start = ctx->start;
 
   DB *db = dbs[h];
   do_scan(db, id, handles[h][cf], &count);
@@ -311,6 +312,7 @@ void *scan_worker(void *p)
   gettimeofday(&t2, NULL);
   long d = (t2.tv_sec - start->tv_sec) * 1000000 + t2.tv_usec - start->tv_usec;
   fprintf(stderr, "Thread %d scan %d KVs, use time: %.3f ms\n", id, count, d / 1000.0);
+  scan_count += count;
   return NULL;
 }
 void *read_worker(void *p)
@@ -332,11 +334,11 @@ void *read_worker(void *p)
     #if KEY_GEN_LOCAL == 1
     string _h_key = ctx->LocalGenerateKey({siz, i, THREAD_N, id});
     auto it = pair<std::string, char *>(_h_key, data);
-    // int h = id % DB_N;
     #else
     auto &it = m->at(i);
     #endif
-    int h = ctx->DBDistribute(it.first);
+    int h = id % DB_N; // 线程绑定db
+    // int h = ctx->DBDistribute(it.first);
     int cf = ctx->CFDistribute(it.first);
     DB *db = dbs[h];
     do_read(db, it, id, handles[h][cf]);
@@ -370,11 +372,11 @@ void *delete_worker(void *p)
     #if KEY_GEN_LOCAL == 1
     string _h_key = ctx->LocalGenerateKey({siz, i, THREAD_N, id});
     auto it = pair<std::string, char *>(_h_key, data);
-    // int h = id % DB_N;
     #else
     auto &it = m->at(i);
     #endif
-    int h = ctx->DBDistribute(it.first);
+    int h = id % DB_N; // 线程绑定db
+    // int h = ctx->DBDistribute(it.first);
     int cf = ctx->CFDistribute(it.first);
     DB *db = dbs[h];
     do_delete(db, it, id, handles[h][cf]);
@@ -392,8 +394,6 @@ void *delete_worker(void *p)
 void getOptions()
 {
   // rocksdb options
-  options.IncreaseParallelism(32);
-  options.OptimizeForPointLookup(0);
   options.create_if_missing = true;
   options.create_missing_column_families = true;
   options.allow_mmap_reads = true;
@@ -403,21 +403,22 @@ void getOptions()
   options.use_direct_io_for_flush_and_compaction = true;
   options.memtable_whole_key_filtering = true;
   options.compression = kNoCompression;
+  options.memtable_prefix_bloom_size_ratio = 0.25;
 
-  options.max_background_jobs = 24;
+  options.IncreaseParallelism(32);
   options.max_subcompactions = 8;
+  options.env->SetBackgroundThreads(8, Env::HIGH);
 
   // options.compaction_style=kCompactionStyleUniversal会优化写性能，但是会加大读放大
-  options.OptimizeLevelStyleCompaction();
   options.write_buffer_size = 64L << 20;
-  options.max_write_buffer_number = 24;
+  options.max_write_buffer_number = 4;
   options.min_write_buffer_number_to_merge = 1;
   // 不能level0_file_num_compaction_trigger设为1，否则让flush线程抢占严重
-  options.level0_file_num_compaction_trigger = 4;
-  options.compaction_readahead_size = 4L << 20;
+  options.level0_file_num_compaction_trigger = 2;
+  options.compaction_readahead_size = 16L << 20;
   options.new_table_reader_for_compaction_inputs = true;
   options.compaction_pri = kOldestSmallestSeqFirst;
-  options.level0_slowdown_writes_trigger = 20;
+  options.level0_slowdown_writes_trigger = -1;
   options.level0_stop_writes_trigger = 10000;
   options.target_file_size_base = options.write_buffer_size;
   options.max_bytes_for_level_multiplier = 10;
@@ -432,74 +433,30 @@ void getOptions()
   read_options.ignore_range_deletions = true;
   read_options.background_purge_on_iterator_cleanup = true;
   table_options.block_size = 4 << 10;
-  table_options.no_block_cache = true;
+  table_options.block_cache = NewLRUCache(1L << 30);
+  // table_options.no_block_cache = true;
   table_options.checksum = kNoChecksum;
-  
+  table_options.cache_index_and_filter_blocks = true;
+  table_options.metadata_cache_options.top_level_index_pinning = PinningTier::kAll;
+  table_options.metadata_cache_options.partition_pinning = PinningTier::kFlushedAndSimilar;
+
   table_options.filter_policy.reset(NewBloomFilterPolicy(12, false));
   options.table_factory.reset(NewBlockBasedTableFactory(table_options));
 
   options.stats_dump_period_sec = 60;
 }
-void getFileChunkWriteOptions() {
-  // rocksdb options
-  options.IncreaseParallelism(32);
-  options.OptimizeForPointLookup(0);
-  options.create_if_missing = true;
-  options.create_missing_column_families = true;
-  options.allow_mmap_reads = true;
-  options.use_adaptive_mutex = true;
-  options.avoid_unnecessary_blocking_io = true;
-  options.unordered_write = true;
-  options.use_direct_io_for_flush_and_compaction = true;
-  options.memtable_whole_key_filtering = true;
-  options.compression = kNoCompression;
-
-  options.max_background_jobs = 28;
-  options.max_subcompactions = 4;
-
-  // options.compaction_style=kCompactionStyleUniversal会优化写性能，但是会加大读放大
-  options.OptimizeLevelStyleCompaction();
-  options.write_buffer_size = 64L << 20;
-  options.max_write_buffer_number = 24;
-  options.min_write_buffer_number_to_merge = 1;
-  // 不能level0_file_num_compaction_trigger设为1，否则让flush线程抢占严重
-  options.level0_file_num_compaction_trigger = 4;
-  options.compaction_readahead_size = 4L << 20;
-  options.new_table_reader_for_compaction_inputs = true;
-  options.compaction_pri = kOldestSmallestSeqFirst;
-  options.level0_slowdown_writes_trigger = 20;
-  options.level0_stop_writes_trigger = 10000;
-  options.target_file_size_base = options.write_buffer_size * 4;
-  options.max_bytes_for_level_multiplier = 10;
-  options.max_bytes_for_level_base = options.target_file_size_base * options.max_bytes_for_level_multiplier;
-
-  #if WAL_OFF == 1
-  write_options.disableWAL = true;
-  #else
-  write_options.disableWAL = false;
-  #endif // WAL_OFF
-  read_options.verify_checksums = false;
-  read_options.ignore_range_deletions = true;
-  read_options.background_purge_on_iterator_cleanup = true;
-  table_options.block_size = 16 << 10;
-  table_options.no_block_cache = true;
-  table_options.checksum = kNoChecksum;
-  
-  table_options.filter_policy.reset(NewBloomFilterPolicy(10, false));
-  options.table_factory.reset(NewBlockBasedTableFactory(table_options));
-
-  options.stats_dump_period_sec = 60;
-}
-void openDBs() {
+void bindCore() {
   // bind core
 	// pthread_spin_init(&rocksdb::flash_ca_lock, 0);
 	// for (unsigned i = 1; i <= 30; i++)
 	// {
-	// 	rocksdb::flash_core_array.push_back(i);
+	// 	rocksdb::flash_core_array.push_back(i);chen
 	// }
+}
+void openDBs() {
+  // bindCore();
 
   getOptions();
-  // getFileChunkWriteOptions();
 
   vector<ColumnFamilyDescriptor> column_families = {ColumnFamilyDescriptor(kDefaultColumnFamilyName, ColumnFamilyOptions(options))};
   #if METHOD == 4
@@ -511,7 +468,7 @@ void openDBs() {
   #endif // METHOD
 
   for (int i = 0; i < DB_N; i++) {
-    Status s = DB::Open(options, "/mnt/pmem/gyx_xfs_test/kv/tmp" + to_string(i), column_families, handles + i, dbs + i);
+    Status s = DB::Open(options, "kv/tmp" + to_string(i), column_families, handles + i, dbs + i);
     if (!s.ok()) {
       fprintf(stderr, "%s\n", s.getState());
       assert(s.ok());
@@ -619,7 +576,7 @@ int main()
     ctxs[i].run_count_ptr = &write_count;
     ctxs[i].start = &write_start;
     #if KEY_GEN_LOCAL == 1
-    ctxs[i].LocalGenerateKey = GenerateHashKey;
+    ctxs[i].LocalGenerateKey = GenerateBlockLinearKey;
     #endif
     ctxs[i].keyDistribute = keyDistribute;
     ctxs[i].DBDistribute = DBDistribute;
@@ -692,7 +649,7 @@ int main()
     pthread_join(thd[i], NULL);
   }
   gettimeofday(&t2, NULL);
-  // assert(read_count == META_N);
+  assert(read_count == META_N);
   d = (t2.tv_sec - t1.tv_sec) * 1000000 + t2.tv_usec - t1.tv_usec;
   fprintf(stderr, "READ META IO: %.3f Mops\n", 1.0 * META_N / d);
 
@@ -741,6 +698,7 @@ int main()
     pthread_join(thd[i], NULL);
   }
   gettimeofday(&t2, NULL);
+  assert(read_count == META_N);
   d = (t2.tv_sec - t1.tv_sec) * 1000000 + t2.tv_usec - t1.tv_usec;
   cout << "SCAN ALL TIME: " << 1.0 * d / 1000 << " ms" << endl;
 
