@@ -27,6 +27,7 @@
 #include <rocksdb/slice_transform.h>
 #include <rocksdb/rate_limiter.h>
 #include <rocksdb/threadpool.h>
+#include <rocksdb/listener.h>
 
 using namespace std;
 using namespace rocksdb;
@@ -35,6 +36,7 @@ using namespace rocksdb;
 #define THREAD_N 16
 #define DB_N 8
 #define CF_N 1
+#define DISK_N 1
 #define WAL_OFF 0
 #define KEY_GEN_LOCAL 1
 
@@ -80,11 +82,24 @@ struct CTX {
   int (*CFDistribute)(string &key);
 };
 
+class FlushListener : public EventListener {
+  public:
+  FlushListener(struct timeval *flush_timer) : flush_timer(flush_timer) {}
+
+  void OnFlushCompleted(DB* db, const FlushJobInfo& job_info) override {
+    gettimeofday(flush_timer, nullptr);
+  }
+
+  private:
+  struct timeval *flush_timer;
+};
+
 CTX ctxs[THREAD_N * DB_N];
 vector<pair<string, char*>> metadatas[THREAD_N];
 vector<pair<string, char*>> chunkdatas[THREAD_N];
 DB *dbs[DB_N];
 Options options;
+Options db_extend_options[DB_N];
 WriteOptions write_options;
 ReadOptions read_options;
 BlockBasedTableOptions table_options;
@@ -275,6 +290,7 @@ void *write_worker(void *p)
   {
     #if KEY_GEN_LOCAL == 1
     string _h_key = ctx->LocalGenerateKey({siz, i, THREAD_N, id});
+    assert(_h_key.size() == KEY_SIZ);
     auto it = pair<std::string, char *>(_h_key, data);
     #else
     auto &it = m->at(i);
@@ -312,7 +328,7 @@ void *scan_worker(void *p)
   gettimeofday(&t2, NULL);
   long d = (t2.tv_sec - start->tv_sec) * 1000000 + t2.tv_usec - start->tv_usec;
   fprintf(stderr, "Thread %d scan %d KVs, use time: %.3f ms\n", id, count, d / 1000.0);
-  scan_count += count;
+  (*scan_count) += count;
   return NULL;
 }
 void *read_worker(void *p)
@@ -391,7 +407,31 @@ void *delete_worker(void *p)
   }
   return NULL;
 }
-void getOptions()
+struct FlushDetectContext {
+  volatile bool enable;
+  struct timeval *flush_timers;
+};
+void *flush_detect_worker(void *p) {
+  FlushDetectContext *ctx = (FlushDetectContext*)p;
+  struct timeval _t;
+  FlushOptions fl_opt;
+  fl_opt.wait = false;
+  while (ctx->enable) {
+    gettimeofday(&_t, NULL);
+    // 未flush超过30s强制flush剩余的memtable
+    for (int i = 0; i < DB_N; i++) {
+      if (_t.tv_sec - ctx->flush_timers[i].tv_sec >= 30) {
+        dbs[i]->Flush(fl_opt);
+        ctx->flush_timers[i] = _t;
+      }
+    }
+    sleep(10);
+  }
+}
+struct GetOptionsContext {
+  struct timeval *flush_timers;
+};
+void getOptions(GetOptionsContext *ctx)
 {
   // rocksdb options
   options.create_if_missing = true;
@@ -403,7 +443,6 @@ void getOptions()
   options.use_direct_io_for_flush_and_compaction = true;
   options.memtable_whole_key_filtering = true;
   options.compression = kNoCompression;
-  options.memtable_prefix_bloom_size_ratio = 0.25;
 
   options.IncreaseParallelism(32);
   options.max_subcompactions = 8;
@@ -411,17 +450,17 @@ void getOptions()
 
   // options.compaction_style=kCompactionStyleUniversal会优化写性能，但是会加大读放大
   options.write_buffer_size = 64L << 20;
-  options.max_write_buffer_number = 4;
-  options.min_write_buffer_number_to_merge = 1;
+  options.max_write_buffer_number = 32;
+  options.min_write_buffer_number_to_merge = 16;
   // 不能level0_file_num_compaction_trigger设为1，否则让flush线程抢占严重
   options.level0_file_num_compaction_trigger = 2;
   options.compaction_readahead_size = 16L << 20;
   options.new_table_reader_for_compaction_inputs = true;
   options.compaction_pri = kOldestSmallestSeqFirst;
-  options.level0_slowdown_writes_trigger = -1;
+  options.level0_slowdown_writes_trigger = 5000;
   options.level0_stop_writes_trigger = 10000;
-  options.target_file_size_base = options.write_buffer_size;
-  options.max_bytes_for_level_multiplier = 10;
+  options.target_file_size_base = options.write_buffer_size * 5;
+  options.max_bytes_for_level_multiplier = 8;
   options.max_bytes_for_level_base = options.target_file_size_base * options.max_bytes_for_level_multiplier;
 
   #if WAL_OFF == 1
@@ -433,17 +472,31 @@ void getOptions()
   read_options.ignore_range_deletions = true;
   read_options.background_purge_on_iterator_cleanup = true;
   table_options.block_size = 4 << 10;
-  table_options.block_cache = NewLRUCache(1L << 30);
-  // table_options.no_block_cache = true;
+  // table_options.block_cache = NewLRUCache(1L << 30);
+  table_options.no_block_cache = true;
   table_options.checksum = kNoChecksum;
-  table_options.cache_index_and_filter_blocks = true;
-  table_options.metadata_cache_options.top_level_index_pinning = PinningTier::kAll;
-  table_options.metadata_cache_options.partition_pinning = PinningTier::kFlushedAndSimilar;
+  // table_options.cache_index_and_filter_blocks = true;
+  // table_options.metadata_cache_options.top_level_index_pinning = PinningTier::kAll;
+  // table_options.metadata_cache_options.unpartitioned_pinning = PinningTier::kFlushedAndSimilar;
+  // table_options.metadata_cache_options.partition_pinning = PinningTier::kFlushedAndSimilar;
+
+  options.prefix_extractor.reset(NewFixedPrefixTransform(80));
+  options.memtable_prefix_bloom_size_ratio = 0.02;
+  table_options.data_block_index_type = BlockBasedTableOptions::kDataBlockBinaryAndHash;
+  table_options.data_block_hash_table_util_ratio = 0.75;
 
   table_options.filter_policy.reset(NewBloomFilterPolicy(12, false));
   options.table_factory.reset(NewBlockBasedTableFactory(table_options));
 
   options.stats_dump_period_sec = 60;
+
+  for (int i = 0; i < DB_N; i++) {
+    db_extend_options[i] = options;
+    if (ctx != nullptr) {
+      EventListener *flush_listener = new FlushListener(ctx->flush_timers + i);
+      options.listeners.emplace_back(flush_listener);
+    }
+  }
 }
 void bindCore() {
   // bind core
@@ -453,34 +506,53 @@ void bindCore() {
 	// 	rocksdb::flash_core_array.push_back(i);chen
 	// }
 }
-void openDBs() {
+struct OpenDBContext {
+  pthread_t flush_epoll_worker;
+  FlushDetectContext *flush_detect_ctx;
+};
+void openDBs(OpenDBContext *ctx) {
   // bindCore();
 
-  getOptions();
-
-  vector<ColumnFamilyDescriptor> column_families = {ColumnFamilyDescriptor(kDefaultColumnFamilyName, ColumnFamilyOptions(options))};
-  #if METHOD == 4
-  for (int i = 0; i < CF_N - 1; i++) {
-    column_families.push_back(
-      ColumnFamilyDescriptor(to_string(i), ColumnFamilyOptions(options))
-    );
+  GetOptionsContext opt_ctx, *opt_ctx_ptr = nullptr;
+  if (ctx != nullptr) {
+    opt_ctx.flush_timers = ctx->flush_detect_ctx->flush_timers;
+    opt_ctx_ptr = &opt_ctx;
   }
-  #endif // METHOD
+  getOptions(opt_ctx_ptr);
 
   for (int i = 0; i < DB_N; i++) {
-    Status s = DB::Open(options, "kv/tmp" + to_string(i), column_families, handles + i, dbs + i);
+    vector<ColumnFamilyDescriptor> column_families = {ColumnFamilyDescriptor(kDefaultColumnFamilyName, ColumnFamilyOptions(db_extend_options[i]))};
+    #if METHOD == 4
+    for (int i = 0; i < CF_N - 1; i++) {
+      column_families.push_back(
+        ColumnFamilyDescriptor(to_string(i), ColumnFamilyOptions(db_extend_options[i]))
+      );
+    }
+    #endif // METHOD
+
+    string db_path = "/mnt/xfs" + to_string((i % DISK_N) + 1) + "/rocksdb-test/tmp" + to_string(i);
+    Status s = DB::Open(db_extend_options[i], db_path, column_families, handles + i, dbs + i);
     if (!s.ok()) {
       fprintf(stderr, "%s\n", s.getState());
       assert(s.ok());
     }
+    fprintf(stderr, "DB %d load on dir: %s\n", i, db_path.c_str());
   }
 #if WAL_OFF == 1
   for (int i = 0; i < THREAD_N; i++) {
     openWal(i);
   }
 #endif // WAL_OFF
+
+  if (ctx != nullptr) {
+    // start flush detect thread worker
+    for (int i = 0; i < DB_N; i++) {
+      gettimeofday(ctx->flush_detect_ctx->flush_timers + i, NULL);
+    }
+    pthread_create(&ctx->flush_epoll_worker, NULL, flush_detect_worker, ctx->flush_detect_ctx);
+  }
 }
-void closeDBs() {
+void closeDBs(OpenDBContext *ctx) {
 #if METHOD == 4
   for (int j = 0; j < DB_N; j++)
   {
@@ -499,10 +571,14 @@ void closeDBs() {
     close(fds[i]);
   }
 #endif // WAL_OFF
+  if (ctx != nullptr) {
+    ctx->flush_detect_ctx->enable = false;
+    pthread_join(ctx->flush_epoll_worker, NULL);
+  }
 }
-void restartDBs() {
-  closeDBs();
-  openDBs();
+void restartDBs(OpenDBContext *ctx) {
+  closeDBs(ctx);
+  openDBs(ctx);
 }
 unsigned seed;
 
@@ -532,8 +608,25 @@ int main()
   fprintf(stderr, "WAL off: %s\n", (WAL_OFF == 1) ? "true" : "false");
   fprintf(stderr, "KEY GEN locally: %s\n", (KEY_GEN_LOCAL == 1) ? "true" : "false");
 
+  long d;
+  struct timeval t1, t2;
+  pthread_t thd[THREAD_N];
+  struct timeval write_start;
+  atomic<uint64_t> write_count = {0};
+  struct timeval read_start;
+  atomic<uint64_t> read_count = {0};
+
+  struct timeval flush_timers[DB_N];
+
   // open db
-  openDBs();
+  FlushDetectContext fl_ctx = {
+    .enable = true,
+    .flush_timers = flush_timers
+  };
+  OpenDBContext db_ctx = {
+    .flush_detect_ctx = &fl_ctx
+  };
+  openDBs(&db_ctx);
 
   // test data set
   metadata_data = (char*)malloc(META_SIZ);
@@ -557,14 +650,6 @@ int main()
     chunkdatas[keyDistribute(_k)].emplace_back(_k, chunk_data);
   }
   #endif
-
-  long d;
-  struct timeval t1, t2;
-  pthread_t thd[THREAD_N];
-  struct timeval write_start;
-  atomic<uint64_t> write_count = {0};
-  struct timeval read_start;
-  atomic<uint64_t> read_count = {0};
 
   // write
   fprintf(stderr, "=========== WRITE META ===========\n");
@@ -744,7 +829,7 @@ int main()
   // exit
   free(metadata_data);
   free(chunk_data);
-  closeDBs();
+  closeDBs(&db_ctx);
   now = time(0);
   fprintf(stderr, "\n");
   fprintf(stderr, "Test End: %s\n", ctime(&now));
